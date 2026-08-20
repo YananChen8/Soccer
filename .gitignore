@@ -52,6 +52,4 @@ checkpoints/
 *.pt
 /codes/sam3
 /codes/sam3.1
-/tracklab
-SoccerMaster/tracklab
 experiments/
