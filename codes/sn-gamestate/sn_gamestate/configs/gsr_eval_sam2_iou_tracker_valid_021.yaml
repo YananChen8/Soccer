@@ -1,0 +1,62 @@
+# Eval-only config for experiment B: SAM2-IoU tracker final state
+defaults:
+  - dataset: soccernet_gs
+  - eval: gs_hota
+  - engine: offline
+  - state: load
+  - visualization: no_vis
+  - _self_
+
+pipeline: []
+experiment_name: "gsr"
+experiment_subname: "eval_sam2_iou_tracker_valid_021"
+home_dir: "${oc.env:HOME}"
+data_dir: "${project_dir}/datasets"
+model_dir: "${project_dir}/pretrained_models"
+num_cores: 16
+use_wandb: False
+use_rich: True
+
+test_tracking: True
+eval_tracking: True
+print_config: False
+
+dataset:
+  nvid: -1
+  eval_set: "valid"
+  dataset_path: ${data_dir}/SoccerNetGS
+  vids_dict:
+    valid: ["SNGS-021"]
+
+eval:
+  cfg:
+    bbox_column_for_eval: "bbox_ltwh"
+    metrics: ["CLEAR", "HOTA", "Identity"]
+    eval:
+      USE_PARALLEL: True
+      NUM_PARALLEL_CORES: ${num_cores}
+      BREAK_ON_ERROR: False
+      PRINT_RESULTS: True
+      PRINT_ONLY_COMBINED: True
+      PRINT_CONFIG: False
+      TIME_PROGRESS: False
+      DISPLAY_LESS_PROGRESS: False
+      OUTPUT_SUMMARY: True
+      OUTPUT_EMPTY_CLASSES: False
+      OUTPUT_DETAILED: True
+      PLOT_CURVES: True
+
+state:
+  save_file: null
+  compression: 0
+  load_file: "/remote-home/jiayuanrao/yishan/SoccerMaster/codes/sn-gamestate/outputs/gsr/step_3_sam2_iou_tracker_valid_021/states/sn-gamestate.pklz"
+
+project_dir: "${hydra:runtime.cwd}"
+hydra:
+  output_subdir: "configs"
+  job:
+    chdir: True
+  run:
+    dir: "outputs/${experiment_name}/${experiment_subname}"
+  sweep:
+    dir: "multirun_outputs/${experiment_name}/${experiment_subname}"

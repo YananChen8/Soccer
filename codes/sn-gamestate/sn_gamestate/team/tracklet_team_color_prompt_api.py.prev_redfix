@@ -1,0 +1,61 @@
+import pandas as pd
+import numpy as np
+import logging
+from tracklab.pipeline.videolevel_module import VideoLevelModule
+
+log = logging.getLogger(__name__)
+
+# Each video only ever has two of these colors present; the pairing within a video is
+# deliberately consistent (021/023/034: blue+white; 040/041/051/052: yellow+green;
+# 085/091/093: blue+stripes) so mapping each color to a fixed binary side is sufficient --
+# TrackletTeamSideLabeling downstream only needs a correct WITHIN-VIDEO binary split, it
+# converts to 'left'/'right' itself based on average pitch position.
+COLOR_TO_BINARY = {
+    'blue': 0, 'yellow': 0, 'red': 0,
+    'white': 1, 'green': 1, 'stripes': 1,
+}
+
+
+class TrackletTeamColorPrompt(VideoLevelModule):
+    """
+    Team assignment for role="player" derived directly from the SAM3 detection-time text-prompt
+    color (injected as 'team_color_hint' by inject_role_4prompt_v4.py), instead of KMeans
+    clustering on reid embeddings (see TrackletTeamClustering for the original approach).
+
+    Majority-votes the hint per FINAL track_id (post tracklet_agg / concat_tracklets_by_jn /
+    concat_tracklets_by_reid -- those modules only ever remap track_id, never drop unrelated
+    columns, so 'team_color_hint' survives intact even across merged tracklets).
+
+    Same output contract as TrackletTeamClustering (team_cluster in {0, 1}) so the downstream
+    TrackletTeamSideLabeling module is unchanged.
+
+    This module is intended for the 4-color-prompt experiment (M4): it demonstrates SAM3's own
+    color-prompt team-separation ability rather than a downstream clustering algorithm's.
+    """
+    input_columns = ["track_id", "team_color_hint", "role"]
+    output_columns = ["team_cluster"]
+
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def process(self, detections: pd.DataFrame, metadatas: pd.DataFrame):
+        detections['team_cluster'] = np.nan
+
+        if "track_id" not in detections.columns or "team_color_hint" not in detections.columns:
+            log.warning("TrackletTeamColorPrompt: missing track_id or team_color_hint column, "
+                        "all team_cluster left as NaN")
+            return detections
+
+        player_detections = detections[detections.role == "player"]
+        for track_id in player_detections.track_id.unique():
+            if pd.isna(track_id):
+                continue
+            tracklet = player_detections[player_detections.track_id == track_id]
+            hints = tracklet['team_color_hint'].dropna()
+            if len(hints) == 0:
+                continue
+            most_common_color = hints.mode()[0]
+            binary = COLOR_TO_BINARY.get(most_common_color, np.nan)
+            detections.loc[detections.track_id == track_id, 'team_cluster'] = binary
+
+        return detections

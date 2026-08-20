@@ -1,0 +1,77 @@
+# TrackLab SoccerNet smoke config for existing server data: valid/SNGS-021
+defaults:
+  - dataset: soccernet_gs
+  - eval: gs_hota
+  - engine: offline
+  - state: save
+  - visualization: gamestate
+  - modules/bbox_detector: yolov8_person
+  - modules/reid: prtreid
+  - modules/track: bpbreid_strong_sort
+  - modules/legibility: legibility
+  - modules/team: kmeans_embeddings
+  - modules/team_side: mean_position
+  - modules/tracklet_agg: voting_role_jn_filter
+  - modules/pitch: nbjw_calib
+  - modules/calibration: nbjw_calib_decoupled
+  - modules/apply_camera_params: nbjw_calib_apply_params
+  - modules/concat_tracklets_by_jn: concat_tracklets_by_jn
+  - modules/concat_tracklets_by_reid: concat_tracklets_by_reid
+  - modules/remove_outside: remove_outside
+  - _self_
+
+pipeline:
+  - bbox_detector
+  - reid
+  - track
+
+experiment_name: "gsr"
+experiment_subname: "step_1_valid_021"
+home_dir: "${oc.env:HOME}"
+data_dir: "${project_dir}/datasets"
+model_dir: "${project_dir}/pretrained_models"
+num_cores: 16
+use_wandb: False
+use_rich: True
+
+modules:
+  bbox_detector: {batch_size: 16, cfg: {path_to_checkpoint: "${model_dir}/yolo/yolo_v8x6_person_lr_default_best.pt"}}
+  pose_bottomup: {batch_size: 16}
+  reid: {batch_size: 16}
+  track: {batch_size: 16}
+  pitch: {batch_size: 1}
+  calibration: {batch_size: 1}
+  apply_camera_params: {batch_size: 1, use_h: False, use_linalg: False}
+  legibility: {batch_size: 16}
+  jersey_number_detect: {batch_size: 8, cfg: {save_jersey_number_full_detection: True, use_legibility_filter: True}}
+  role: {batch_size: 4, cfg: {downsample_factor: 4}}
+  concat_tracklets_by_reid: {threshold: 0.1}
+
+test_tracking: True
+eval_tracking: False
+print_config: False
+
+dataset:
+  nvid: -1
+  eval_set: "valid"
+  dataset_path: ${data_dir}/SoccerNetGS
+  vids_dict:
+    valid: ["SNGS-021"]
+
+state:
+  save_file: "states/sn-gamestate.pklz"
+  load_file: null
+
+visualization:
+  cfg:
+    save_videos: False
+
+project_dir: "${hydra:runtime.cwd}"
+hydra:
+  output_subdir: "configs"
+  job:
+    chdir: True
+  run:
+    dir: "outputs/${experiment_name}/${experiment_subname}"
+  sweep:
+    dir: "multirun_outputs/${experiment_name}/${experiment_subname}"

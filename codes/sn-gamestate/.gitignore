@@ -1,0 +1,107 @@
+# ===================== Python =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境 conda / venv
+venv/
+env/
+.venv/
+.env/
+conda_env/
+*.conda
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+*.pyc
+
+# ===================== ML / 大模型项目 =====================
+# 模型权重、数据集、大tar包
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.h5
+*.hdf5
+
+datasets/
+checkpoints/
+weights/
+models/
+outputs/
+runs/
+logs/
+log/
+*.log
+
+# ===================== IDE 编辑器 =====================
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.out
+*.idea
+
+# vim
+*.swp
+*.swo
+*~
+
+# ===================== 系统文件 =====================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ===================== Docker / 临时文件 =====================
+*.tmp
+*.temp
+/tmp/
+
+# ===================== 环境密钥 =====================
+.env
+*.env
+secret*.yaml
+api_key*.txt
+
+
+# 方式2：忽略项目**所有位置**叫 datasets 的文件夹（子目录里的也忽略）
+datasets/
+outputs/
+dataset/
+pretrained_models/
