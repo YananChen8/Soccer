@@ -857,6 +857,26 @@ def dedupe_records(records: List[Dict[str, Any]], nms_iou: float) -> List[Dict[s
     return kept
 
 
+def dedupe_track_frame_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[Tuple[Any, int, int], Dict[str, Any]] = {}
+    for record in records:
+        key = (record["video_id"], int(record["image_id"]), int(record["track_id"]))
+        previous = best.get(key)
+        if previous is None:
+            best[key] = record
+            continue
+        previous_score = float(previous.get("bbox_conf", 0.0))
+        current_score = float(record.get("bbox_conf", 0.0))
+        if (current_score, bbox_area(record["bbox_ltwh"])) > (
+            previous_score,
+            bbox_area(previous["bbox_ltwh"]),
+        ):
+            best[key] = record
+    deduped = list(best.values())
+    deduped.sort(key=lambda r: (str(r["video_id"]), int(r["image_id"]), int(r["track_id"])))
+    return deduped
+
+
 def stitch_chunk_tracks(records: List[Dict[str, Any]], stitch_iou: float) -> List[Dict[str, Any]]:
     if stitch_iou <= 0 or not records:
         return records
@@ -1149,17 +1169,30 @@ def run_builder(args: argparse.Namespace) -> None:
                 if args.stitch_chunks:
                     before_track_count = len({int(record["track_id"]) for record in video_records})
                     video_records = stitch_chunk_tracks(video_records, args.stitch_iou)
+                    before_unique = len(video_records)
+                    video_records = dedupe_track_frame_records(video_records)
                     after_track_count = len({int(record["track_id"]) for record in video_records})
                     LOG.info(
-                        "%s chunk stitch: %d -> %d track ids",
+                        "%s chunk stitch: %d -> %d track ids; frame-track rows %d -> %d",
                         video,
                         before_track_count,
                         after_track_count,
+                        before_unique,
+                        len(video_records),
                     )
+                else:
+                    before_unique = len(video_records)
+                    video_records = dedupe_track_frame_records(video_records)
+                    if len(video_records) != before_unique:
+                        LOG.info("%s frame-track dedupe: %d -> %d detections", video, before_unique, len(video_records))
                 if not args.no_dedupe:
                     before = len(video_records)
                     video_records = dedupe_records(video_records, args.nms_iou)
                     LOG.info("%s dedupe: %d -> %d detections", video, before, len(video_records))
+                    before_unique = len(video_records)
+                    video_records = dedupe_track_frame_records(video_records)
+                    if len(video_records) != before_unique:
+                        LOG.info("%s post-dedupe frame-track dedupe: %d -> %d detections", video, before_unique, len(video_records))
                 detections_by_video[video] = records_to_dataframe(video_records)
     finally:
         close_predictor(predictor)

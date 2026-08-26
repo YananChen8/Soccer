@@ -12,6 +12,10 @@ VERSION="${VERSION:-sam3}"
 PROMPTS="${PROMPTS:-player}"
 PROMPT_TEAM_COLORS="${PROMPT_TEAM_COLORS:-}"
 VIDEO="${VIDEO:-SNGS-021}"
+MAX_NUM_OBJECTS="${MAX_NUM_OBJECTS:-48}"
+CHUNK_FRAMES="${CHUNK_FRAMES:-0}"
+CHUNK_OVERLAP="${CHUNK_OVERLAP:-10}"
+STITCH_IOU="${STITCH_IOU:-0.5}"
 
 IFS='|' read -r -a PROMPT_ARGS <<< "$PROMPTS"
 
@@ -23,8 +27,26 @@ COMMON_ARGS=(
   --sam3-root "$SAM3_ROOT"
   --version "$VERSION"
   --prompts "${PROMPT_ARGS[@]}"
+  --max-num-objects "$MAX_NUM_OBJECTS"
   --overwrite
 )
+
+if [[ "${OFFLOAD_VIDEO_TO_CPU:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--offload-video-to-cpu)
+fi
+
+if [[ "${OFFLOAD_STATE_TO_CPU:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--offload-state-to-cpu)
+fi
+
+if [[ "$CHUNK_FRAMES" != "0" ]]; then
+  COMMON_ARGS+=(
+    --chunk-frames "$CHUNK_FRAMES"
+    --chunk-overlap "$CHUNK_OVERLAP"
+    --stitch-chunks
+    --stitch-iou "$STITCH_IOU"
+  )
+fi
 
 if [[ -n "${PROMPT_TEAM_COLORS}" ]]; then
   IFS='|' read -r -a COLOR_ARGS <<< "$PROMPT_TEAM_COLORS"

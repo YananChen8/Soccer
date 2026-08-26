@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
             "Use this only for image-space SoccerNetGS eval exports."
         ),
     )
+    parser.add_argument(
+        "--dedupe-track-frame",
+        action="store_true",
+        help="Keep one row per (video_id, image_id, track_id), choosing highest confidence then largest bbox.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -61,6 +66,10 @@ def bbox_to_image_eval_bbox_pitch(box: Sequence[float]) -> dict[str, float]:
     }
 
 
+def bbox_area(box: Sequence[float]) -> float:
+    return max(0.0, float(box[2])) * max(0.0, float(box[3]))
+
+
 def add_image_eval_bbox_pitch(df: Any) -> Any:
     if "bbox_ltwh" not in df.columns:
         raise KeyError("Cannot add bbox_pitch placeholder because bbox_ltwh is missing")
@@ -71,6 +80,27 @@ def add_image_eval_bbox_pitch(df: Any) -> Any:
         for current, bbox in zip(existing, df["bbox_ltwh"])
     ]
     return df
+
+
+def dedupe_track_frame(df: Any) -> Any:
+    required = {"video_id", "image_id", "track_id"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise KeyError(f"Cannot dedupe frame-track rows because columns are missing: {missing}")
+    best: dict[tuple[str, int, int], tuple[float, float, Any]] = {}
+    for index, row in df.iterrows():
+        key = (str(row["video_id"]), int(row["image_id"]), int(row["track_id"]))
+        confidence = row["bbox_conf"] if "bbox_conf" in df.columns else 0.0
+        try:
+            confidence_score = float(confidence)
+        except Exception:
+            confidence_score = 0.0
+        area = bbox_area(row["bbox_ltwh"]) if "bbox_ltwh" in df.columns else 0.0
+        previous = best.get(key)
+        if previous is None or (confidence_score, area) > (previous[0], previous[1]):
+            best[key] = (confidence_score, area, index)
+    keep_indices = [item[2] for item in best.values()]
+    return df.loc[keep_indices].sort_values(["video_id", "image_id", "track_id"]).reset_index(drop=True)
 
 
 def add_detection_column_to_summary(payload: dict[str, Any], column: str) -> None:
@@ -93,6 +123,7 @@ def remap_dataframe_member(
     out_member: str,
     new_video_id: str,
     add_bbox_pitch: bool = False,
+    dedupe: bool = False,
 ) -> None:
     with zf_in.open(member, "r") as fh:
         df = pickle.load(fh)
@@ -100,6 +131,8 @@ def remap_dataframe_member(
         df.loc[:, "video_id"] = str(new_video_id)
     if add_bbox_pitch:
         df = add_image_eval_bbox_pitch(df)
+    if dedupe:
+        df = dedupe_track_frame(df)
     with zf_out.open(out_member, "w", force_zip64=True) as fh:
         pickle.dump(df, fh, protocol=pickle.DEFAULT_PROTOCOL)
 
@@ -146,6 +179,7 @@ def main() -> None:
                         out_member,
                         new_video_id,
                         add_bbox_pitch=args.add_image_eval_bbox_pitch and member == old_det,
+                        dedupe=args.dedupe_track_frame and member == old_det,
                     )
                     remapped_members.append((member, out_member))
                 elif member == "summary.json":
@@ -159,6 +193,14 @@ def main() -> None:
                             {
                                 "name": "image_eval_bbox_pitch_placeholder",
                                 "source": "bbox_ltwh bottom-center in image coordinates",
+                            }
+                        )
+                    if args.dedupe_track_frame:
+                        payload.setdefault("state_patches", []).append(
+                            {
+                                "name": "dedupe_track_frame",
+                                "key": ["video_id", "image_id", "track_id"],
+                                "keep": "highest bbox_conf then largest bbox_ltwh area",
                             }
                         )
                     zf_out.writestr(member, json.dumps(payload, ensure_ascii=False, indent=2))

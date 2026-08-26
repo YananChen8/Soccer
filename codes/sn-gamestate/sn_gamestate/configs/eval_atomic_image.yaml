@@ -44,9 +44,9 @@ eval:
     metrics:
       - "HOTA"
     eval:
-      USE_PARALLEL: True
-      NUM_PARALLEL_CORES: ${num_cores}
-      BREAK_ON_ERROR: False
+      USE_PARALLEL: False
+      NUM_PARALLEL_CORES: 1
+      BREAK_ON_ERROR: True
       PRINT_RESULTS: True
       PRINT_ONLY_COMBINED: True
       PRINT_CONFIG: False
@@ -55,7 +55,7 @@ eval:
       OUTPUT_SUMMARY: True
       OUTPUT_EMPTY_CLASSES: False
       OUTPUT_DETAILED: True
-      PLOT_CURVES: True
+      PLOT_CURVES: False
 
 state:
   save_file: null

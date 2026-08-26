@@ -32,6 +32,7 @@ class Detection:
     frame: int
     track_id: str
     bbox_ltwh: Tuple[float, float, float, float]
+    pitch_xy: Optional[Tuple[float, float]] = None
     role: Optional[str] = None
     team: Optional[str] = None
     jersey: Optional[str] = None
@@ -240,6 +241,34 @@ def bbox_from_record(record: Mapping[str, Any], bbox_format: str) -> Optional[Tu
     return None
 
 
+def pitch_xy_from_value(value: Any) -> Optional[Tuple[float, float]]:
+    if is_missing(value):
+        return None
+    value = scalar(value)
+    if isinstance(value, Mapping):
+        if {"x_bottom_middle", "y_bottom_middle"}.issubset(value):
+            return (float(value["x_bottom_middle"]), float(value["y_bottom_middle"]))
+        if {"x", "y"}.issubset(value):
+            return (float(value["x"]), float(value["y"]))
+        if {"X", "Y"}.issubset(value):
+            return (float(value["X"]), float(value["Y"]))
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return (float(value[0]), float(value[1]))
+    return None
+
+
+def pitch_xy_from_record(record: Mapping[str, Any]) -> Optional[Tuple[float, float]]:
+    for key in ("bbox_pitch", "pitch", "pitch_xy", "position", "track_bbox_pitch"):
+        if key in record:
+            pitch_xy = pitch_xy_from_value(record[key])
+            if pitch_xy is not None:
+                return pitch_xy
+    return None
+
+
 def attrs_from_record(record: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     attrs_value = record.get("attributes")
     attrs = attrs_value if isinstance(attrs_value, Mapping) else {}
@@ -313,6 +342,7 @@ def load_json_detections(
         if frame is None or track_id is None or bbox is None:
             continue
         role, team, jersey = attrs_from_record(record)
+        pitch_xy = pitch_xy_from_record(record)
         conf = record.get("bbox_conf", record.get("confidence", 1.0))
         detections.append(
             Detection(
@@ -320,6 +350,7 @@ def load_json_detections(
                 frame=frame,
                 track_id=normalize_track_id(track_id),
                 bbox_ltwh=bbox,
+                pitch_xy=pitch_xy,
                 role=role,
                 team=team,
                 jersey=jersey,
@@ -442,6 +473,7 @@ def load_state_detections(
                 if bbox is None or track_id is None or is_missing(track_id):
                     continue
                 role, team, jersey = attrs_from_record(record)
+                pitch_xy = pitch_xy_from_record(record)
                 conf = record.get("bbox_conf", record.get("track_bbox_conf", 1.0))
                 loaded[video].append(
                     Detection(
@@ -449,6 +481,7 @@ def load_state_detections(
                         frame=frame,
                         track_id=normalize_track_id(track_id),
                         bbox_ltwh=bbox,
+                        pitch_xy=pitch_xy,
                         role=role,
                         team=team,
                         jersey=jersey,
