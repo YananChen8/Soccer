@@ -71,6 +71,9 @@ DETECTION_COLUMNS = [
     "sam3_prompt",
     "sam3_prompt_index",
     "sam3_source_obj_id",
+    "sam3_chunk_index",
+    "sam3_chunk_start_frame",
+    "sam3_chunk_end_frame",
     "sam3_recondition_every",
     "sam3_prompt_refresh_every",
 ]
@@ -213,6 +216,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-dedupe", action="store_true")
     parser.add_argument("--id-offset", type=int, default=1_000_000)
+    parser.add_argument("--chunk-id-offset", type=int, default=10_000)
+    parser.add_argument(
+        "--chunk-frames",
+        type=int,
+        default=0,
+        help="Run each video in independent frame chunks to cap SAM3 memory. 0 means full video.",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=0,
+        help="Number of frames overlapped between chunks. Only used with --chunk-frames.",
+    )
+    parser.add_argument(
+        "--stitch-chunks",
+        action="store_true",
+        help="Merge track ids across overlapped chunks using image-space bbox IoU.",
+    )
+    parser.add_argument("--stitch-iou", type=float, default=0.5)
     parser.add_argument("--max-num-objects", type=int, default=64)
     parser.add_argument("--multiplex-count", type=int, default=16)
     parser.add_argument("--gpus", default=None, help="Comma-separated GPU ids for sam3 multi-GPU.")
@@ -441,6 +463,60 @@ def prompt_frames_for_video(args: argparse.Namespace, num_frames: int) -> List[i
     return [min(max(args.start_frame, 0), num_frames - 1)]
 
 
+def iter_frame_chunks(
+    frame_refs: Sequence[FrameRef],
+    chunk_frames: int,
+    chunk_overlap: int,
+) -> Iterable[Tuple[int, int, int, Sequence[FrameRef]]]:
+    num_frames = len(frame_refs)
+    if chunk_frames <= 0 or chunk_frames >= num_frames:
+        yield 0, 0, num_frames, frame_refs
+        return
+    if chunk_overlap < 0:
+        raise ValueError("--chunk-overlap must be >= 0")
+    if chunk_overlap >= chunk_frames:
+        raise ValueError("--chunk-overlap must be smaller than --chunk-frames")
+
+    step = chunk_frames - chunk_overlap
+    chunk_index = 0
+    start = 0
+    while start < num_frames:
+        end = min(start + chunk_frames, num_frames)
+        yield chunk_index, start, end, frame_refs[start:end]
+        if end >= num_frames:
+            break
+        start += step
+        chunk_index += 1
+
+
+def prompt_frames_for_chunk(
+    args: argparse.Namespace,
+    chunk_start: int,
+    chunk_len: int,
+    full_len: int,
+) -> List[int]:
+    if chunk_len <= 0:
+        return []
+    if args.chunk_frames <= 0:
+        return prompt_frames_for_video(args, chunk_len)
+
+    chunk_end = chunk_start + chunk_len
+    if args.prompt_frames is not None and len(args.prompt_frames) > 0:
+        local_frames = sorted(
+            {int(frame) - chunk_start for frame in args.prompt_frames if chunk_start <= int(frame) < chunk_end}
+        )
+        return local_frames or [0]
+
+    if args.prompt_refresh_every and args.prompt_refresh_every > 0:
+        start = max(int(args.start_frame), 0)
+        global_frames = range(start, full_len, int(args.prompt_refresh_every))
+        local_frames = {int(frame) - chunk_start for frame in global_frames if chunk_start <= int(frame) < chunk_end}
+        local_frames.add(0)
+        return sorted(local_frames)
+
+    return [0]
+
+
 def normalize_recondition_every(args: argparse.Namespace) -> int:
     if args.recondition_every is not None:
         return int(args.recondition_every)
@@ -628,6 +704,9 @@ def collect_prompt_records(
     prompt_index: int,
     team_color_hint: Optional[str],
     prompt_frames: Sequence[int],
+    chunk_index: int,
+    chunk_start_frame: int,
+    chunk_end_frame: int,
     args: argparse.Namespace,
     recondition_every: int,
 ) -> List[Dict[str, Any]]:
@@ -695,7 +774,11 @@ def collect_prompt_records(
                 if max_area is not None and area > max_area:
                     continue
                 score = float(scores[local_idx]) if scores.ndim >= 1 and local_idx < len(scores) else 1.0
-                track_id = prompt_index * args.id_offset + int(obj_id)
+                track_id = (
+                    prompt_index * args.id_offset
+                    + int(chunk_index) * args.chunk_id_offset
+                    + int(obj_id)
+                )
                 records.append(
                     {
                         "video_id": frame_ref.video_id,
@@ -713,6 +796,9 @@ def collect_prompt_records(
                         "sam3_prompt": prompt,
                         "sam3_prompt_index": int(prompt_index),
                         "sam3_source_obj_id": int(obj_id),
+                        "sam3_chunk_index": int(chunk_index),
+                        "sam3_chunk_start_frame": int(chunk_start_frame),
+                        "sam3_chunk_end_frame": int(chunk_end_frame),
                         "sam3_recondition_every": int(recondition_every),
                         "sam3_prompt_refresh_every": int(args.prompt_refresh_every or 0),
                     }
@@ -747,6 +833,90 @@ def dedupe_records(records: List[Dict[str, Any]], nms_iou: float) -> List[Dict[s
         kept.extend(frame_kept)
     kept.sort(key=lambda r: (int(r["video_id"]), int(r["image_id"]), int(r["track_id"])))
     return kept
+
+
+def stitch_chunk_tracks(records: List[Dict[str, Any]], stitch_iou: float) -> List[Dict[str, Any]]:
+    if stitch_iou <= 0 or not records:
+        return records
+
+    parent: Dict[int, int] = {}
+
+    def find(track_id: int) -> int:
+        parent.setdefault(track_id, track_id)
+        while parent[track_id] != track_id:
+            parent[track_id] = parent[parent[track_id]]
+            track_id = parent[track_id]
+        return track_id
+
+    def union(source: int, target: int) -> None:
+        source_root = find(source)
+        target_root = find(target)
+        if source_root != target_root:
+            parent[source_root] = target_root
+
+    by_video_chunk: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for record in records:
+        video_id = int(record["video_id"])
+        chunk_index = int(record.get("sam3_chunk_index", 0))
+        by_video_chunk.setdefault((video_id, chunk_index), []).append(record)
+
+    video_ids = sorted({video_id for video_id, _ in by_video_chunk.keys()})
+    for video_id in video_ids:
+        chunk_indices = sorted(chunk for current_video, chunk in by_video_chunk if current_video == video_id)
+        for previous_chunk, next_chunk in zip(chunk_indices, chunk_indices[1:]):
+            previous_records = by_video_chunk[(video_id, previous_chunk)]
+            next_records = by_video_chunk[(video_id, next_chunk)]
+            previous_by_image = group_records_by_image(previous_records)
+            next_by_image = group_records_by_image(next_records)
+            common_image_ids = sorted(set(previous_by_image) & set(next_by_image))
+            if not common_image_ids:
+                continue
+
+            pair_ious: Dict[Tuple[int, int], List[float]] = {}
+            for image_id in common_image_ids:
+                for previous in previous_by_image[image_id]:
+                    previous_track_id = int(previous["track_id"])
+                    for current in next_by_image[image_id]:
+                        current_track_id = int(current["track_id"])
+                        if previous_track_id == current_track_id:
+                            continue
+                        iou = bbox_iou(previous["bbox_ltwh"], current["bbox_ltwh"])
+                        if iou > 0:
+                            pair_ious.setdefault((previous_track_id, current_track_id), []).append(iou)
+
+            candidates = sorted(
+                (
+                    (float(np.mean(values)), previous_track_id, current_track_id)
+                    for (previous_track_id, current_track_id), values in pair_ious.items()
+                    if float(np.mean(values)) >= stitch_iou
+                ),
+                reverse=True,
+            )
+            used_previous: set[int] = set()
+            used_current: set[int] = set()
+            for score, previous_track_id, current_track_id in candidates:
+                if previous_track_id in used_previous or current_track_id in used_current:
+                    continue
+                union(current_track_id, previous_track_id)
+                used_previous.add(previous_track_id)
+                used_current.add(current_track_id)
+
+    remapped = 0
+    for record in records:
+        old_track_id = int(record["track_id"])
+        new_track_id = find(old_track_id)
+        if new_track_id != old_track_id:
+            record["track_id"] = new_track_id
+            remapped += 1
+    LOG.info("Chunk stitching remapped %d detections", remapped)
+    return records
+
+
+def group_records_by_image(records: Sequence[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    by_image: Dict[int, List[Dict[str, Any]]] = {}
+    for record in records:
+        by_image.setdefault(int(record["image_id"]), []).append(record)
+    return by_image
 
 
 def records_to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -793,6 +963,11 @@ def write_state(
             "version": args.version,
             "mode": args.mode,
             "max_num_objects": args.max_num_objects,
+            "chunk_frames": args.chunk_frames,
+            "chunk_overlap": args.chunk_overlap,
+            "chunk_id_offset": args.chunk_id_offset,
+            "stitch_chunks": bool(args.stitch_chunks),
+            "stitch_iou": args.stitch_iou,
             "recondition_every": recondition_every,
             "prompt_refresh_every": args.prompt_refresh_every,
             "offload_video_to_cpu": bool(args.offload_video_to_cpu),
@@ -843,13 +1018,17 @@ def make_prompt_color_hints(args: argparse.Namespace) -> List[Optional[str]]:
     return [str(color) for color in colors]
 
 
-def copy_frames_to_sam3_names(frame_refs: Sequence[FrameRef], tmp_root: Path) -> Path:
+def copy_frames_to_sam3_names(
+    frame_refs: Sequence[FrameRef],
+    tmp_root: Path,
+    dirname: Optional[str] = None,
+) -> Path:
     """SAM3 can read arbitrary image names, but zero-padded names avoid loader surprises."""
-    out_dir = tmp_root / frame_refs[0].video
+    out_dir = tmp_root / (dirname or frame_refs[0].video)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ref in frame_refs:
+    for local_index, ref in enumerate(frame_refs):
         suffix = ref.file_path.suffix.lower() or ".jpg"
-        target = out_dir / f"{ref.sam3_index:05d}{suffix}"
+        target = out_dir / f"{local_index:05d}{suffix}"
         if target.exists():
             continue
         try:
@@ -892,31 +1071,68 @@ def run_builder(args: argparse.Namespace) -> None:
         with tempfile.TemporaryDirectory(prefix="sam3_gsr_frames_") as tmp:
             tmp_root = Path(tmp)
             for video, refs in frame_refs_by_video.items():
-                frame_dir = copy_frames_to_sam3_names(refs, tmp_root)
-                prompt_frames = prompt_frames_for_video(args, len(refs))
                 video_records: List[Dict[str, Any]] = []
+                chunks = list(iter_frame_chunks(refs, args.chunk_frames, args.chunk_overlap))
                 LOG.info(
-                    "Running %s with %d prompts, prompt_frames=%s",
+                    "Running %s with %d prompts over %d chunks",
                     video,
                     len(args.prompts),
-                    prompt_frames,
+                    len(chunks),
                 )
-                for prompt_index, (prompt, color) in enumerate(zip(args.prompts, prompt_colors)):
-                    records = collect_prompt_records(
-                        predictor=predictor,
-                        frame_dir=frame_dir,
-                        frame_refs=refs,
-                        prompt=prompt,
-                        prompt_index=prompt_index,
-                        team_color_hint=color,
-                        prompt_frames=prompt_frames,
-                        args=args,
-                        recondition_every=recondition_every,
+                for chunk_index, chunk_start, chunk_end, chunk_refs in chunks:
+                    chunk_dirname = f"{video}_chunk_{chunk_index:04d}_{chunk_start:06d}_{chunk_end - 1:06d}"
+                    frame_dir = copy_frames_to_sam3_names(chunk_refs, tmp_root, dirname=chunk_dirname)
+                    prompt_frames = prompt_frames_for_chunk(
+                        args,
+                        chunk_start=chunk_start,
+                        chunk_len=len(chunk_refs),
+                        full_len=len(refs),
                     )
-                    LOG.info("%s prompt %r produced %d detections", video, prompt, len(records))
-                    video_records.extend(records)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    LOG.info(
+                        "Running %s chunk %d/%d frames=%d..%d prompt_frames=%s",
+                        video,
+                        chunk_index + 1,
+                        len(chunks),
+                        chunk_start,
+                        chunk_end - 1,
+                        prompt_frames,
+                    )
+                    for prompt_index, (prompt, color) in enumerate(zip(args.prompts, prompt_colors)):
+                        records = collect_prompt_records(
+                            predictor=predictor,
+                            frame_dir=frame_dir,
+                            frame_refs=chunk_refs,
+                            prompt=prompt,
+                            prompt_index=prompt_index,
+                            team_color_hint=color,
+                            prompt_frames=prompt_frames,
+                            chunk_index=chunk_index,
+                            chunk_start_frame=chunk_start,
+                            chunk_end_frame=chunk_end - 1,
+                            args=args,
+                            recondition_every=recondition_every,
+                        )
+                        LOG.info(
+                            "%s chunk %d prompt %r produced %d detections",
+                            video,
+                            chunk_index,
+                            prompt,
+                            len(records),
+                        )
+                        video_records.extend(records)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    shutil.rmtree(frame_dir, ignore_errors=True)
+                if args.stitch_chunks:
+                    before_track_count = len({int(record["track_id"]) for record in video_records})
+                    video_records = stitch_chunk_tracks(video_records, args.stitch_iou)
+                    after_track_count = len({int(record["track_id"]) for record in video_records})
+                    LOG.info(
+                        "%s chunk stitch: %d -> %d track ids",
+                        video,
+                        before_track_count,
+                        after_track_count,
+                    )
                 if not args.no_dedupe:
                     before = len(video_records)
                     video_records = dedupe_records(video_records, args.nms_iou)
