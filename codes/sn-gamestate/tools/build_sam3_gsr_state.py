@@ -228,6 +228,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--warm-up", action="store_true")
     parser.add_argument("--sync-loading-frames", action="store_true")
+    parser.add_argument(
+        "--offload-video-to-cpu",
+        action="store_true",
+        help="Keep loaded video frames on CPU to reduce GPU memory use.",
+    )
+    parser.add_argument(
+        "--offload-state-to-cpu",
+        action="store_true",
+        help="Keep SAM3 tracking state on CPU to reduce GPU memory use at lower speed.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Scan inputs and exit before loading SAM3.")
     parser.add_argument("--log-level", default="INFO")
@@ -490,8 +500,30 @@ def build_predictor(args: argparse.Namespace, recondition_every: int):
             kwargs["gpus_to_use"] = gpus
     LOG.info("Building %s predictor", args.version)
     predictor = build_sam3_predictor(**kwargs)
+    set_max_num_objects(predictor, args.max_num_objects)
     set_recondition_every(predictor, recondition_every)
     return torch, predictor
+
+
+def set_max_num_objects(predictor: Any, limit: int) -> None:
+    if limit <= 0:
+        return
+    targets = []
+    if hasattr(predictor, "model"):
+        targets.append(predictor.model)
+    targets.append(predictor)
+    updated = 0
+    for target in targets:
+        if hasattr(target, "max_num_objects"):
+            setattr(target, "max_num_objects", int(limit))
+            world_size = int(getattr(target, "world_size", 1) or 1)
+            if hasattr(target, "num_obj_for_compile"):
+                setattr(target, "num_obj_for_compile", max(1, (int(limit) + world_size - 1) // world_size))
+            updated += 1
+    if updated == 0:
+        LOG.warning("Could not find max_num_objects on predictor/model")
+    else:
+        LOG.info("Set internal SAM3 max_num_objects to %d", limit)
 
 
 def set_recondition_every(predictor: Any, interval: int) -> None:
@@ -599,7 +631,14 @@ def collect_prompt_records(
     args: argparse.Namespace,
     recondition_every: int,
 ) -> List[Dict[str, Any]]:
-    session = predictor.handle_request({"type": "start_session", "resource_path": str(frame_dir)})
+    session = predictor.handle_request(
+        {
+            "type": "start_session",
+            "resource_path": str(frame_dir),
+            "offload_video_to_cpu": bool(args.offload_video_to_cpu),
+            "offload_state_to_cpu": bool(args.offload_state_to_cpu),
+        }
+    )
     session_id = session["session_id"]
     width, height = read_image_size(frame_refs[0].file_path)
     max_area = width * height * args.max_mask_area_frac if args.max_mask_area_frac > 0 else None
@@ -753,8 +792,11 @@ def write_state(
         "sam3_builder": {
             "version": args.version,
             "mode": args.mode,
+            "max_num_objects": args.max_num_objects,
             "recondition_every": recondition_every,
             "prompt_refresh_every": args.prompt_refresh_every,
+            "offload_video_to_cpu": bool(args.offload_video_to_cpu),
+            "offload_state_to_cpu": bool(args.offload_state_to_cpu),
             "prompts": list(args.prompts),
             "videos": list(frame_refs_by_video.keys()),
             "created_unix": time.time(),
