@@ -18,23 +18,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="Input pklz state.")
     parser.add_argument("--output", type=Path, required=True, help="Output pklz state.")
-    parser.add_argument("--old-video-id", type=int, required=True)
-    parser.add_argument("--new-video-id", type=int, default=None)
-    parser.add_argument("--video", default=None, help="Optional name such as SNGS-021; implies --new-video-id 21.")
+    parser.add_argument("--old-video-id", required=True)
+    parser.add_argument("--new-video-id", default=None)
+    parser.add_argument("--video", default=None, help="Optional name such as SNGS-021; implies --new-video-id 021.")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def infer_video_id(video: Optional[str]) -> Optional[int]:
+def infer_video_id(video: Optional[str]) -> Optional[str]:
     if not video:
         return None
     match = re.fullmatch(r"SNGS-(\d+)", video)
-    return int(match.group(1)) if match else None
+    return match.group(1) if match else None
 
 
-def resolve_new_video_id(args: argparse.Namespace) -> int:
+def resolve_new_video_id(args: argparse.Namespace) -> str:
     if args.new_video_id is not None:
-        return int(args.new_video_id)
+        return str(args.new_video_id)
     inferred = infer_video_id(args.video)
     if inferred is not None:
         return inferred
@@ -46,17 +46,17 @@ def remap_dataframe_member(
     zf_out: zipfile.ZipFile,
     member: str,
     out_member: str,
-    new_video_id: int,
+    new_video_id: str,
 ) -> None:
     with zf_in.open(member, "r") as fh:
         df = pickle.load(fh)
     if "video_id" in df.columns:
-        df.loc[:, "video_id"] = int(new_video_id)
+        df.loc[:, "video_id"] = str(new_video_id)
     with zf_out.open(out_member, "w", force_zip64=True) as fh:
         pickle.dump(df, fh, protocol=pickle.DEFAULT_PROTOCOL)
 
 
-def remap_member_name(member: str, old_video_id: int, new_video_id: int) -> str:
+def remap_member_name(member: str, old_video_id: str, new_video_id: str) -> str:
     if member == f"{old_video_id}.pkl":
         return f"{new_video_id}.pkl"
     if member == f"{old_video_id}_image.pkl":

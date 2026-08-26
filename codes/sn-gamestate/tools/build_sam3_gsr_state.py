@@ -83,7 +83,7 @@ IMAGE_COLUMNS = ["video_id", "file_path", "frame"]
 @dataclass(frozen=True)
 class FrameRef:
     video: str
-    video_id: int
+    video_id: Any
     image_id: int
     frame: int
     sam3_index: int
@@ -92,7 +92,7 @@ class FrameRef:
 
 @dataclass
 class MetadataIndex:
-    video_to_id: Dict[str, int]
+    video_to_id: Dict[str, Any]
     image_rows_by_video_frame: Dict[Tuple[str, int], Dict[str, Any]]
     next_image_id: int
 
@@ -287,11 +287,11 @@ def discover_videos(root: Path, videos: Optional[Sequence[str]]) -> List[str]:
     return found
 
 
-def infer_video_id_from_name(video: str) -> Optional[int]:
+def infer_video_id_from_name(video: str) -> Optional[str]:
     match = re.fullmatch(r"SNGS-(\d+)", video)
     if not match:
         return None
-    return int(match.group(1))
+    return match.group(1)
 
 
 def frame_dir_for_video(root: Path, video: str) -> Path:
@@ -346,18 +346,18 @@ def video_from_text(value: Any) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def load_json_mapping(path: Optional[Path]) -> Dict[str, int]:
+def load_json_mapping(path: Optional[Path]) -> Dict[str, Any]:
     if path is None:
         return {}
     with path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
-    return {str(k): int(v) for k, v in data.items()}
+    return {str(k): v for k, v in data.items()}
 
 
 def load_metadata_state(path: Optional[Path]) -> MetadataIndex:
     if path is None:
         return MetadataIndex(video_to_id={}, image_rows_by_video_frame={}, next_image_id=0)
-    video_to_id: Dict[str, int] = {}
+    video_to_id: Dict[str, Any] = {}
     image_rows: Dict[Tuple[str, int], Dict[str, Any]] = {}
     next_image_id = 0
     with zipfile.ZipFile(path, "r") as zf:
@@ -365,7 +365,7 @@ def load_metadata_state(path: Optional[Path]) -> MetadataIndex:
             if not member.endswith("_image.pkl"):
                 continue
             member_stem = Path(member).stem
-            member_video_id = int(member_stem.removesuffix("_image"))
+            member_video_id = member_stem.removesuffix("_image")
             with zf.open(member, "r") as fh:
                 df = pickle.load(fh)
             if not isinstance(df, pd.DataFrame):
@@ -382,7 +382,7 @@ def load_metadata_state(path: Optional[Path]) -> MetadataIndex:
                     frame = parse_frame_number(record.get("file_path"))
                 if video is None or frame is None:
                     continue
-                video_id = int(record.get("video_id", member_video_id))
+                video_id = record.get("video_id", member_video_id)
                 record["image_id"] = int(image_id)
                 record["video_id"] = video_id
                 image_rows[(video, frame)] = record
@@ -401,7 +401,7 @@ def prepare_frames(
     root: Path,
     videos: Sequence[str],
     metadata: MetadataIndex,
-    video_id_map: Mapping[str, int],
+    video_id_map: Mapping[str, Any],
     nframes: int,
     preserve_metadata_file_path: bool,
 ) -> Dict[str, List[FrameRef]]:
@@ -415,9 +415,9 @@ def prepare_frames(
 
     for video in videos:
         if video in video_id_map:
-            video_id = int(video_id_map[video])
+            video_id = video_id_map[video]
         elif video in metadata.video_to_id:
-            video_id = int(metadata.video_to_id[video])
+            video_id = metadata.video_to_id[video]
         else:
             inferred_video_id = infer_video_id_from_name(video)
             if inferred_video_id is not None and inferred_video_id not in used_video_ids:
@@ -427,7 +427,8 @@ def prepare_frames(
                     next_video_id += 1
                 video_id = next_video_id
             used_video_ids.add(video_id)
-            next_video_id = max(next_video_id, video_id + 1)
+            if isinstance(video_id, int):
+                next_video_id = max(next_video_id, video_id + 1)
 
         frame_files = list_frame_files(frame_dir_for_video(root, video), nframes)
         frame_refs: List[FrameRef] = []
@@ -827,9 +828,9 @@ def collect_prompt_records(
 def dedupe_records(records: List[Dict[str, Any]], nms_iou: float) -> List[Dict[str, Any]]:
     if nms_iou <= 0:
         return records
-    by_frame: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    by_frame: Dict[Tuple[Any, int], List[Dict[str, Any]]] = {}
     for record in records:
-        by_frame.setdefault((int(record["video_id"]), int(record["image_id"])), []).append(record)
+        by_frame.setdefault((record["video_id"], int(record["image_id"])), []).append(record)
     kept: List[Dict[str, Any]] = []
     for frame_records in by_frame.values():
         ordered = sorted(
@@ -842,7 +843,7 @@ def dedupe_records(records: List[Dict[str, Any]], nms_iou: float) -> List[Dict[s
             if all(bbox_iou(record["bbox_ltwh"], other["bbox_ltwh"]) < nms_iou for other in frame_kept):
                 frame_kept.append(record)
         kept.extend(frame_kept)
-    kept.sort(key=lambda r: (int(r["video_id"]), int(r["image_id"]), int(r["track_id"])))
+    kept.sort(key=lambda r: (str(r["video_id"]), int(r["image_id"]), int(r["track_id"])))
     return kept
 
 
@@ -865,13 +866,13 @@ def stitch_chunk_tracks(records: List[Dict[str, Any]], stitch_iou: float) -> Lis
         if source_root != target_root:
             parent[source_root] = target_root
 
-    by_video_chunk: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    by_video_chunk: Dict[Tuple[Any, int], List[Dict[str, Any]]] = {}
     for record in records:
-        video_id = int(record["video_id"])
+        video_id = record["video_id"]
         chunk_index = int(record.get("sam3_chunk_index", 0))
         by_video_chunk.setdefault((video_id, chunk_index), []).append(record)
 
-    video_ids = sorted({video_id for video_id, _ in by_video_chunk.keys()})
+    video_ids = sorted({video_id for video_id, _ in by_video_chunk.keys()}, key=str)
     for video_id in video_ids:
         chunk_indices = sorted(chunk for current_video, chunk in by_video_chunk if current_video == video_id)
         for previous_chunk, next_chunk in zip(chunk_indices, chunk_indices[1:]):
