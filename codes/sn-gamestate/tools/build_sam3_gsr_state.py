@@ -216,6 +216,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-objects", type=int, default=64)
     parser.add_argument("--multiplex-count", type=int, default=16)
     parser.add_argument("--gpus", default=None, help="Comma-separated GPU ids for sam3 multi-GPU.")
+    parser.add_argument(
+        "--collective-timeout-sec",
+        type=int,
+        default=1800,
+        help=(
+            "SAM3 multi-GPU NCCL/Gloo collective timeout. The upstream default is "
+            "180 seconds, which can be too short for long videos."
+        ),
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--warm-up", action="store_true")
     parser.add_argument("--sync-loading-frames", action="store_true")
@@ -476,6 +485,8 @@ def build_predictor(args: argparse.Namespace, recondition_every: int):
     else:
         gpus = parse_gpus(args.gpus)
         if gpus is not None:
+            if args.collective_timeout_sec > 0:
+                os.environ["SAM3_COLLECTIVE_OP_TIMEOUT_SEC"] = str(args.collective_timeout_sec)
             kwargs["gpus_to_use"] = gpus
     LOG.info("Building %s predictor", args.version)
     predictor = build_sam3_predictor(**kwargs)
