@@ -61,6 +61,7 @@ DETECTION_COLUMNS = [
     "category_id",
     "bbox_ltwh",
     "bbox_conf",
+    "bbox_pitch",
     "track_id",
     "track_bbox_ltwh",
     "track_bbox_conf",
@@ -678,6 +679,14 @@ def bbox_area(box: Sequence[float]) -> float:
     return max(0.0, float(box[2])) * max(0.0, float(box[3]))
 
 
+def bbox_to_image_bottom_middle(box: Sequence[float]) -> Dict[str, float]:
+    left, top, width, height = [float(value) for value in box[:4]]
+    return {
+        "x_bottom_middle": left + width / 2.0,
+        "y_bottom_middle": top + height,
+    }
+
+
 def bbox_iou(a: Sequence[float], b: Sequence[float]) -> float:
     ax1, ay1, aw, ah = [float(v) for v in a]
     bx1, by1, bw, bh = [float(v) for v in b]
@@ -798,6 +807,7 @@ def collect_prompt_records(
                         "category_id": 1,
                         "bbox_ltwh": np.asarray(bbox, dtype=np.float32),
                         "bbox_conf": score,
+                        "bbox_pitch": bbox_to_image_bottom_middle(bbox),
                         "track_id": int(track_id),
                         "track_bbox_ltwh": np.asarray(bbox, dtype=np.float32),
                         "track_bbox_conf": score,
@@ -984,6 +994,7 @@ def write_state(
             "prompt_refresh_every": args.prompt_refresh_every,
             "offload_video_to_cpu": bool(args.offload_video_to_cpu),
             "offload_state_to_cpu": bool(args.offload_state_to_cpu),
+            "bbox_pitch": "image_bottom_middle_placeholder_for_image_eval",
             "prompts": list(args.prompts),
             "videos": list(frame_refs_by_video.keys()),
             "created_unix": time.time(),
