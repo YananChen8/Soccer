@@ -1,0 +1,11 @@
+# Atomic pitch-space localization eval for valid/SNGS-021 only.
+defaults:
+  - eval_atomic_pitch
+  - _self_
+
+experiment_subname: "eval_atomic_pitch_021"
+
+dataset:
+  vids_dict:
+    valid: ["SNGS-021"]
+

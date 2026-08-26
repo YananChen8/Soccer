@@ -287,6 +287,13 @@ def discover_videos(root: Path, videos: Optional[Sequence[str]]) -> List[str]:
     return found
 
 
+def infer_video_id_from_name(video: str) -> Optional[int]:
+    match = re.fullmatch(r"SNGS-(\d+)", video)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def frame_dir_for_video(root: Path, video: str) -> Path:
     video_dir = root / video
     img1_dir = video_dir / "img1"
@@ -412,11 +419,15 @@ def prepare_frames(
         elif video in metadata.video_to_id:
             video_id = int(metadata.video_to_id[video])
         else:
-            while next_video_id in used_video_ids:
-                next_video_id += 1
-            video_id = next_video_id
+            inferred_video_id = infer_video_id_from_name(video)
+            if inferred_video_id is not None and inferred_video_id not in used_video_ids:
+                video_id = inferred_video_id
+            else:
+                while next_video_id in used_video_ids:
+                    next_video_id += 1
+                video_id = next_video_id
             used_video_ids.add(video_id)
-            next_video_id += 1
+            next_video_id = max(next_video_id, video_id + 1)
 
         frame_files = list_frame_files(frame_dir_for_video(root, video), nframes)
         frame_refs: List[FrameRef] = []
