@@ -683,6 +683,8 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    max_num_objects: int = -1,
+    recondition_every_nth_frame: int = -1,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -757,7 +759,12 @@ def build_sam3_video_model(
             suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
             suppress_det_close_to_boundary=False,
             fill_hole_area=16,
-            recondition_every_nth_frame=16,
+            max_num_objects=max_num_objects,
+            recondition_every_nth_frame=(
+                recondition_every_nth_frame
+                if recondition_every_nth_frame >= 0
+                else 16
+            ),
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             image_size=1008,
@@ -784,7 +791,12 @@ def build_sam3_video_model(
             suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
             suppress_det_close_to_boundary=False,
             fill_hole_area=16,
-            recondition_every_nth_frame=0,
+            max_num_objects=max_num_objects,
+            recondition_every_nth_frame=(
+                recondition_every_nth_frame
+                if recondition_every_nth_frame >= 0
+                else 0
+            ),
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
             image_size=1008,
@@ -1247,8 +1259,9 @@ def build_sam3_predictor(
     compile: bool = False,
     warm_up: bool = False,
     # SAM 3.1 specific
-    max_num_objects: int = 16,
+    max_num_objects: Optional[int] = None,
     multiplex_count: int = 16,
+    recondition_every_nth_frame: int = -1,
     # Common
     use_fa3: bool = True,
     use_rope_real: bool = True,
@@ -1264,8 +1277,9 @@ def build_sam3_predictor(
         version: Model version - "sam3" for base or "sam3.1" for multiplex
         compile: Enable torch.compile for ~2x speedup (SAM 3.1 only currently)
         warm_up: Run warm-up compilation passes
-        max_num_objects: Maximum tracked objects (SAM 3.1 only)
+        max_num_objects: Maximum tracked objects. Defaults to 16 for SAM3.1 and unlimited for SAM3 base.
         multiplex_count: Objects per multiplex bucket (SAM 3.1 only)
+        recondition_every_nth_frame: Recondition interval for SAM3 base. Use -1 for the default.
         use_fa3: Use Flash Attention 3
         use_rope_real: Use real-valued RoPE
         async_loading_frames: Load video frames asynchronously
@@ -1297,7 +1311,7 @@ def build_sam3_predictor(
         return build_sam3_multiplex_video_predictor(
             checkpoint_path=checkpoint_path,
             bpe_path=bpe_path,
-            max_num_objects=max_num_objects,
+            max_num_objects=16 if max_num_objects is None else max_num_objects,
             multiplex_count=multiplex_count,
             use_fa3=use_fa3,
             use_rope_real=use_rope_real,
@@ -1312,6 +1326,8 @@ def build_sam3_predictor(
             bpe_path=bpe_path,
             compile=compile,
             async_loading_frames=async_loading_frames,
+            max_num_objects=-1 if max_num_objects is None else max_num_objects,
+            recondition_every_nth_frame=recondition_every_nth_frame,
             **kwargs,
         )
     else:

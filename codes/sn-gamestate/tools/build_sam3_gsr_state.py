@@ -595,13 +595,14 @@ def build_predictor(args: argparse.Namespace, recondition_every: int):
         "compile": args.compile,
         "warm_up": args.warm_up,
         "async_loading_frames": not args.sync_loading_frames,
+        "max_num_objects": args.max_num_objects,
     }
     if args.checkpoint is not None:
         kwargs["checkpoint_path"] = str(args.checkpoint)
     if args.version == "sam3.1":
-        kwargs["max_num_objects"] = args.max_num_objects
         kwargs["multiplex_count"] = args.multiplex_count
     else:
+        kwargs["recondition_every_nth_frame"] = recondition_every
         gpus = parse_gpus(args.gpus)
         if gpus is not None:
             validate_visible_gpus(torch, gpus)
@@ -610,46 +611,27 @@ def build_predictor(args: argparse.Namespace, recondition_every: int):
             kwargs["gpus_to_use"] = gpus
     LOG.info("Building %s predictor", args.version)
     predictor = build_sam3_predictor(**kwargs)
-    set_max_num_objects(predictor, args.max_num_objects)
-    set_recondition_every(predictor, recondition_every)
+    log_predictor_limits(predictor)
     return torch, predictor
 
 
-def set_max_num_objects(predictor: Any, limit: int) -> None:
-    if limit <= 0:
-        return
-    targets = []
+def log_predictor_limits(predictor: Any) -> None:
+    targets: List[Any] = []
     if hasattr(predictor, "model"):
         targets.append(predictor.model)
     targets.append(predictor)
-    updated = 0
     for target in targets:
-        if hasattr(target, "max_num_objects"):
-            setattr(target, "max_num_objects", int(limit))
-            world_size = int(getattr(target, "world_size", 1) or 1)
-            if hasattr(target, "num_obj_for_compile"):
-                setattr(target, "num_obj_for_compile", max(1, (int(limit) + world_size - 1) // world_size))
-            updated += 1
-    if updated == 0:
-        LOG.warning("Could not find max_num_objects on predictor/model")
-    else:
-        LOG.info("Set internal SAM3 max_num_objects to %d", limit)
-
-
-def set_recondition_every(predictor: Any, interval: int) -> None:
-    targets = []
-    if hasattr(predictor, "model"):
-        targets.append(predictor.model)
-    targets.append(predictor)
-    updated = 0
-    for target in targets:
-        if hasattr(target, "recondition_every_nth_frame"):
-            setattr(target, "recondition_every_nth_frame", int(interval))
-            updated += 1
-    if updated == 0:
-        LOG.warning("Could not find recondition_every_nth_frame on predictor/model")
-    else:
-        LOG.info("Set internal SAM3 recondition interval to %d", interval)
+        max_num_objects = getattr(target, "max_num_objects", None)
+        recondition = getattr(target, "recondition_every_nth_frame", None)
+        num_obj_for_compile = getattr(target, "num_obj_for_compile", None)
+        if max_num_objects is not None or recondition is not None:
+            LOG.info(
+                "SAM3 predictor config on %s: max_num_objects=%s, num_obj_for_compile=%s, recondition_every_nth_frame=%s",
+                type(target).__name__,
+                max_num_objects,
+                num_obj_for_compile,
+                recondition,
+            )
 
 
 def close_predictor(predictor: Any) -> None:
