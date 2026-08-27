@@ -238,7 +238,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stitch-iou", type=float, default=0.5)
     parser.add_argument("--max-num-objects", type=int, default=64)
     parser.add_argument("--multiplex-count", type=int, default=16)
-    parser.add_argument("--gpus", default=None, help="Comma-separated GPU ids for sam3 multi-GPU.")
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help=(
+            "Comma-separated SAM3 multi-GPU ids inside the current process. "
+            "With CUDA_VISIBLE_DEVICES=4,5,6,7, use --gpus 0,1,2,3."
+        ),
+    )
     parser.add_argument(
         "--collective-timeout-sec",
         type=int,
@@ -568,6 +575,19 @@ def parse_gpus(value: Optional[str]) -> Optional[List[int]]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def validate_visible_gpus(torch: Any, gpus: Sequence[int]) -> None:
+    device_count = int(torch.cuda.device_count())
+    bad = [gpu for gpu in gpus if gpu < 0 or gpu >= device_count]
+    if not bad:
+        return
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_hint = f" CUDA_VISIBLE_DEVICES={visible!r} exposes them as 0..{device_count - 1}." if visible else ""
+    raise ValueError(
+        f"--gpus must use process-local CUDA ids, but got {gpus} with {device_count} visible CUDA devices."
+        f"{visible_hint} For example, with CUDA_VISIBLE_DEVICES=4,5,6,7 pass --gpus 0,1,2,3."
+    )
+
+
 def build_predictor(args: argparse.Namespace, recondition_every: int):
     torch, build_sam3_predictor = import_sam3(args)
     kwargs: Dict[str, Any] = {
@@ -584,6 +604,7 @@ def build_predictor(args: argparse.Namespace, recondition_every: int):
     else:
         gpus = parse_gpus(args.gpus)
         if gpus is not None:
+            validate_visible_gpus(torch, gpus)
             if args.collective_timeout_sec > 0:
                 os.environ["SAM3_COLLECTIVE_OP_TIMEOUT_SEC"] = str(args.collective_timeout_sec)
             kwargs["gpus_to_use"] = gpus
