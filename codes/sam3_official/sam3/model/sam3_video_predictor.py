@@ -317,8 +317,13 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
                         f"stopping worker {rank=} as its parent process has exited"
                     )
                     sys.exit(1)
-            except Exception as e:
-                logger.error(f"worker {rank=} exception: {e}", exc_info=True)
+            except Exception:
+                logger.exception("worker rank=%d failed", rank)
+                try:
+                    result_queue.put(("worker_error", rank))
+                except Exception:
+                    pass
+                raise
 
     def shutdown(self):
         """Shutdown all worker processes."""
@@ -326,9 +331,21 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
             logger.info(f"shutting down {self.world_size - 1} worker processes")
             for rank in range(1, self.world_size):
                 self.command_queues[rank].put(("shutdown", False))
-            torch.distributed.destroy_process_group()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
             for rank in range(1, self.world_size):
-                self.result_queues[rank].get()  # wait for the worker to acknowledge
+                try:
+                    message = self.result_queues[rank].get(timeout=60)
+                    if message[0] != "shutdown":
+                        logger.error("worker rank=%d exited with message %r", rank, message)
+                except queue.Empty:
+                    logger.error("timed out waiting for worker rank=%d shutdown ack", rank)
+                    pid = getattr(self, "worker_pids", {}).get(rank)
+                    if pid is not None and psutil.pid_exists(pid):
+                        try:
+                            psutil.Process(pid).terminate()
+                        except Exception:
+                            logger.exception("failed to terminate worker rank=%d pid=%s", rank, pid)
             logger.info(f"shut down {self.world_size - 1} worker processes")
         self.has_shutdown = True
 
