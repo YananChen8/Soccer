@@ -38,6 +38,7 @@ import os
 import pickle
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -96,6 +97,18 @@ class MetadataIndex:
     video_to_id: Dict[str, Any]
     image_rows_by_video_frame: Dict[Tuple[str, int], Dict[str, Any]]
     next_image_id: int
+
+
+@dataclass(frozen=True)
+class ChunkWorkerJob:
+    video: str
+    chunk_index: int
+    frame_start_index: int
+    frame_end_index: int
+    image_id_start: int
+    prompt_frames: List[int]
+    out_path: Path
+    log_path: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +203,18 @@ def parse_args() -> argparse.Namespace:
         help="When --metadata-state is used, keep image file_path from that state.",
     )
     parser.add_argument("--nframes", type=int, default=-1, help="Limit frames per video.")
+    parser.add_argument(
+        "--frame-start-index",
+        type=int,
+        default=0,
+        help="Advanced/internal: first sorted frame index to process before --nframes is applied.",
+    )
+    parser.add_argument(
+        "--frame-end-index",
+        type=int,
+        default=-1,
+        help="Advanced/internal: exclusive sorted frame index to process. -1 means the end.",
+    )
     parser.add_argument("--start-frame", type=int, default=0, help="Default first prompt frame.")
     parser.add_argument(
         "--propagation-direction",
@@ -245,6 +270,32 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated SAM3 multi-GPU ids inside the current process. "
             "With CUDA_VISIBLE_DEVICES=4,5,6,7, use --gpus 0,1,2,3."
         ),
+    )
+    parser.add_argument(
+        "--worker-gpus",
+        default=None,
+        help=(
+            "Comma-separated CUDA_VISIBLE_DEVICES values for robust process-per-chunk parallelism. "
+            "This avoids SAM3's same-session NCCL multi-GPU path; use with --chunk-frames."
+        ),
+    )
+    parser.add_argument(
+        "--worker-log-dir",
+        type=Path,
+        default=None,
+        help="Directory for per-chunk worker logs when --worker-gpus is used.",
+    )
+    parser.add_argument(
+        "--chunk-index-override",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--image-id-start",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--collective-timeout-sec",
@@ -335,11 +386,21 @@ def frame_sort_key(path: Path) -> Tuple[int, str]:
     return (parsed if parsed is not None else 10**12, path.name)
 
 
-def list_frame_files(frame_dir: Path, nframes: int) -> List[Path]:
+def list_frame_files(
+    frame_dir: Path,
+    nframes: int,
+    frame_start_index: int = 0,
+    frame_end_index: int = -1,
+) -> List[Path]:
     files = sorted(
         [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
         key=frame_sort_key,
     )
+    start = max(0, int(frame_start_index or 0))
+    end = len(files) if frame_end_index is None or frame_end_index < 0 else min(int(frame_end_index), len(files))
+    if start >= end:
+        raise FileNotFoundError(f"No image frames selected in {frame_dir} for range [{start}, {end})")
+    files = files[start:end]
     if nframes and nframes > 0:
         files = files[:nframes]
     if not files:
@@ -412,6 +473,9 @@ def prepare_frames(
     video_id_map: Mapping[str, Any],
     nframes: int,
     preserve_metadata_file_path: bool,
+    frame_start_index: int = 0,
+    frame_end_index: int = -1,
+    image_id_start: Optional[int] = None,
 ) -> Dict[str, List[FrameRef]]:
     next_video_id = 0
     next_image_id = metadata.next_image_id
@@ -438,7 +502,12 @@ def prepare_frames(
             if isinstance(video_id, int):
                 next_video_id = max(next_video_id, video_id + 1)
 
-        frame_files = list_frame_files(frame_dir_for_video(root, video), nframes)
+        frame_files = list_frame_files(
+            frame_dir_for_video(root, video),
+            nframes,
+            frame_start_index=frame_start_index,
+            frame_end_index=frame_end_index,
+        )
         frame_refs: List[FrameRef] = []
         for sam3_index, path in enumerate(frame_files):
             parsed_frame = parse_frame_number(path.name)
@@ -447,6 +516,9 @@ def prepare_frames(
             if meta_row is not None:
                 image_id = int(meta_row["image_id"])
                 file_path = Path(meta_row["file_path"]) if preserve_metadata_file_path else path
+            elif image_id_start is not None:
+                image_id = int(image_id_start) + int(sam3_index)
+                file_path = path
             else:
                 image_id = next_image_id
                 next_image_id += 1
@@ -573,6 +645,12 @@ def parse_gpus(value: Optional[str]) -> Optional[List[int]]:
     if not value:
         return None
     return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_worker_gpus(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def validate_visible_gpus(torch: Any, gpus: Sequence[int]) -> None:
@@ -775,59 +853,70 @@ def collect_prompt_records(
             outputs = response.get("outputs", {})
             if not isinstance(outputs, Mapping):
                 continue
-            obj_ids = to_numpy(outputs.get("out_obj_ids"))
-            boxes = to_numpy(outputs.get("out_boxes_xywh"))
-            scores = to_numpy(outputs.get("out_probs"))
-            masks = to_numpy(outputs.get("out_binary_masks"))
-            if obj_ids.size == 0:
-                continue
-            frame_ref = frame_refs[int(frame_idx)]
-            for local_idx, obj_id in enumerate(obj_ids.tolist()):
-                if boxes.ndim >= 2 and local_idx < len(boxes):
-                    bbox = denormalize_xywh(boxes[local_idx], width, height)
-                elif masks.ndim >= 3 and local_idx < len(masks):
-                    fallback = mask_to_bbox(masks[local_idx])
-                    if fallback is None:
+            try:
+                obj_ids = to_numpy(outputs.get("out_obj_ids"))
+                boxes = to_numpy(outputs.get("out_boxes_xywh"))
+                scores = to_numpy(outputs.get("out_probs"))
+                masks: Optional[np.ndarray] = None
+                if obj_ids.size == 0:
+                    continue
+                frame_ref = frame_refs[int(frame_idx)]
+                for local_idx, obj_id in enumerate(obj_ids.tolist()):
+                    if boxes.ndim >= 2 and local_idx < len(boxes):
+                        bbox = denormalize_xywh(boxes[local_idx], width, height)
+                    else:
+                        if masks is None:
+                            masks = to_numpy(outputs.get("out_binary_masks"))
+                        if masks.ndim < 3 or local_idx >= len(masks):
+                            continue
+                        fallback = mask_to_bbox(masks[local_idx])
+                        if fallback is None:
+                            continue
+                        bbox = fallback
+                    area = bbox_area(bbox)
+                    if area < args.min_mask_area:
                         continue
-                    bbox = fallback
-                else:
-                    continue
-                area = bbox_area(bbox)
-                if area < args.min_mask_area:
-                    continue
-                if max_area is not None and area > max_area:
-                    continue
-                score = float(scores[local_idx]) if scores.ndim >= 1 and local_idx < len(scores) else 1.0
-                track_id = (
-                    prompt_index * args.id_offset
-                    + int(chunk_index) * args.chunk_id_offset
-                    + int(obj_id)
+                    if max_area is not None and area > max_area:
+                        continue
+                    score = float(scores[local_idx]) if scores.ndim >= 1 and local_idx < len(scores) else 1.0
+                    track_id = (
+                        prompt_index * args.id_offset
+                        + int(chunk_index) * args.chunk_id_offset
+                        + int(obj_id)
+                    )
+                    records.append(
+                        {
+                            "video_id": frame_ref.video_id,
+                            "image_id": frame_ref.image_id,
+                            "category_id": 1,
+                            "bbox_ltwh": np.asarray(bbox, dtype=np.float32),
+                            "bbox_conf": score,
+                            "bbox_pitch": bbox_to_image_bottom_middle(bbox),
+                            "track_id": int(track_id),
+                            "track_bbox_ltwh": np.asarray(bbox, dtype=np.float32),
+                            "track_bbox_conf": score,
+                            "role_detection": "player",
+                            "role_confidence": 1.0,
+                            "role": "player",
+                            "team_color_hint": team_color_hint,
+                            "sam3_prompt": prompt,
+                            "sam3_prompt_index": int(prompt_index),
+                            "sam3_source_obj_id": int(obj_id),
+                            "sam3_chunk_index": int(chunk_index),
+                            "sam3_chunk_start_frame": int(chunk_start_frame),
+                            "sam3_chunk_end_frame": int(chunk_end_frame),
+                            "sam3_recondition_every": int(recondition_every),
+                            "sam3_prompt_refresh_every": int(args.prompt_refresh_every or 0),
+                        }
+                    )
+            except Exception:
+                LOG.exception(
+                    "Failed to parse SAM3 output for prompt %r at local frame %s; "
+                    "continuing to keep multi-GPU ranks synchronized.",
+                    prompt,
+                    frame_idx,
                 )
-                records.append(
-                    {
-                        "video_id": frame_ref.video_id,
-                        "image_id": frame_ref.image_id,
-                        "category_id": 1,
-                        "bbox_ltwh": np.asarray(bbox, dtype=np.float32),
-                        "bbox_conf": score,
-                        "bbox_pitch": bbox_to_image_bottom_middle(bbox),
-                        "track_id": int(track_id),
-                        "track_bbox_ltwh": np.asarray(bbox, dtype=np.float32),
-                        "track_bbox_conf": score,
-                        "role_detection": "player",
-                        "role_confidence": 1.0,
-                        "role": "player",
-                        "team_color_hint": team_color_hint,
-                        "sam3_prompt": prompt,
-                        "sam3_prompt_index": int(prompt_index),
-                        "sam3_source_obj_id": int(obj_id),
-                        "sam3_chunk_index": int(chunk_index),
-                        "sam3_chunk_start_frame": int(chunk_start_frame),
-                        "sam3_chunk_end_frame": int(chunk_end_frame),
-                        "sam3_recondition_every": int(recondition_every),
-                        "sam3_prompt_refresh_every": int(args.prompt_refresh_every or 0),
-                    }
-                )
+                continue
     finally:
         try:
             predictor.handle_request(
@@ -1013,6 +1102,8 @@ def write_state(
             "chunk_id_offset": args.chunk_id_offset,
             "stitch_chunks": bool(args.stitch_chunks),
             "stitch_iou": args.stitch_iou,
+            "worker_gpus": parse_worker_gpus(args.worker_gpus),
+            "worker_mode": "process_per_chunk" if args.worker_gpus else None,
             "recondition_every": recondition_every,
             "prompt_refresh_every": args.prompt_refresh_every,
             "offload_video_to_cpu": bool(args.offload_video_to_cpu),
@@ -1084,6 +1175,383 @@ def copy_frames_to_sam3_names(
     return out_dir
 
 
+def output_run_root(out_path: Path) -> Path:
+    if out_path.parent.name == "states":
+        return out_path.parent.parent
+    return out_path.parent
+
+
+def make_chunk_worker_jobs(
+    args: argparse.Namespace,
+    frame_refs_by_video: Mapping[str, Sequence[FrameRef]],
+) -> List[ChunkWorkerJob]:
+    run_root = output_run_root(args.out)
+    state_root = run_root / "chunk_worker_states"
+    log_dir = args.worker_log_dir or (run_root / "chunk_worker_logs")
+    jobs: List[ChunkWorkerJob] = []
+
+    for video, refs in frame_refs_by_video.items():
+        chunks = list(iter_frame_chunks(refs, args.chunk_frames, args.chunk_overlap))
+        for chunk_index, chunk_start, chunk_end, chunk_refs in chunks:
+            chunk_name = f"{video}_chunk_{chunk_index:04d}_{chunk_start:06d}_{chunk_end - 1:06d}"
+            prompt_frames = prompt_frames_for_chunk(
+                args,
+                chunk_start=chunk_start,
+                chunk_len=len(chunk_refs),
+                full_len=len(refs),
+            )
+            jobs.append(
+                ChunkWorkerJob(
+                    video=video,
+                    chunk_index=int(chunk_index),
+                    frame_start_index=int(args.frame_start_index or 0) + int(chunk_start),
+                    frame_end_index=int(args.frame_start_index or 0) + int(chunk_end),
+                    image_id_start=int(chunk_refs[0].image_id),
+                    prompt_frames=prompt_frames or [0],
+                    out_path=state_root / video / chunk_name / "sn-gamestate.pklz",
+                    log_path=log_dir / f"{chunk_name}.log",
+                )
+            )
+    return jobs
+
+
+def add_option(cmd: List[str], name: str, value: Any) -> None:
+    if value is not None:
+        cmd.extend([name, str(value)])
+
+
+def add_multi_option(cmd: List[str], name: str, values: Optional[Sequence[Any]]) -> None:
+    if values:
+        cmd.append(name)
+        cmd.extend(str(value) for value in values)
+
+
+def add_flag(cmd: List[str], name: str, enabled: bool) -> None:
+    if enabled:
+        cmd.append(name)
+
+
+def build_chunk_worker_command(args: argparse.Namespace, job: ChunkWorkerJob) -> List[str]:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--dataset-root",
+        str(args.dataset_root),
+        "--split",
+        str(args.split),
+        "--videos",
+        job.video,
+        "--out",
+        str(job.out_path),
+        "--sam3-root",
+        str(args.sam3_root),
+        "--version",
+        str(args.version),
+        "--mode",
+        str(args.mode),
+        "--frame-start-index",
+        str(job.frame_start_index),
+        "--frame-end-index",
+        str(job.frame_end_index),
+        "--image-id-start",
+        str(job.image_id_start),
+        "--chunk-index-override",
+        str(job.chunk_index),
+        "--chunk-frames",
+        "0",
+        "--chunk-overlap",
+        "0",
+        "--start-frame",
+        str(args.start_frame),
+        "--propagation-direction",
+        str(args.propagation_direction),
+        "--output-prob-thresh",
+        str(args.output_prob_thresh),
+        "--min-mask-area",
+        str(args.min_mask_area),
+        "--max-mask-area-frac",
+        str(args.max_mask_area_frac),
+        "--nms-iou",
+        str(args.nms_iou),
+        "--id-offset",
+        str(args.id_offset),
+        "--chunk-id-offset",
+        str(args.chunk_id_offset),
+        "--max-num-objects",
+        str(args.max_num_objects),
+        "--multiplex-count",
+        str(args.multiplex_count),
+        "--prompt-refresh-every",
+        str(args.prompt_refresh_every or 0),
+        "--log-level",
+        str(args.log_level),
+        "--overwrite",
+    ]
+    if args.checkpoint is not None:
+        add_option(cmd, "--checkpoint", args.checkpoint)
+    if args.recondition_every is not None:
+        add_option(cmd, "--recondition-every", args.recondition_every)
+    add_multi_option(cmd, "--prompt-frames", job.prompt_frames)
+    add_multi_option(cmd, "--prompts", args.prompts)
+    add_multi_option(cmd, "--prompt-team-colors", args.prompt_team_colors)
+    add_option(cmd, "--metadata-state", args.metadata_state)
+    add_option(cmd, "--video-id-map", args.video_id_map)
+    add_flag(cmd, "--preserve-metadata-file-path", bool(args.preserve_metadata_file_path))
+    add_flag(cmd, "--no-dedupe", bool(args.no_dedupe))
+    add_flag(cmd, "--compile", bool(args.compile))
+    add_flag(cmd, "--warm-up", bool(args.warm_up))
+    add_flag(cmd, "--sync-loading-frames", bool(args.sync_loading_frames))
+    add_flag(cmd, "--offload-video-to-cpu", bool(args.offload_video_to_cpu))
+    add_flag(cmd, "--offload-state-to-cpu", bool(args.offload_state_to_cpu))
+    return cmd
+
+
+def chunk_worker_env(gpu: str) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    for key in (
+        "IS_MAIN_PROCESS",
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def log_tail(path: Path, max_lines: int = 80) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        return f"<failed to read {path}: {exc}>"
+    return "\n".join(lines[-max_lines:])
+
+
+def terminate_workers(active: Sequence[Tuple[subprocess.Popen, ChunkWorkerJob, str, Any]]) -> None:
+    for proc, _job, _gpu, _log_fh in active:
+        if proc.poll() is None:
+            proc.terminate()
+    deadline = time.time() + 20.0
+    for proc, _job, _gpu, log_fh in active:
+        try:
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.2)
+            if proc.poll() is None:
+                proc.kill()
+        finally:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+
+
+def run_chunk_worker_processes(
+    args: argparse.Namespace,
+    jobs: Sequence[ChunkWorkerJob],
+    worker_gpus: Sequence[str],
+) -> None:
+    pending = list(jobs)
+    active: List[Tuple[subprocess.Popen, ChunkWorkerJob, str, Any]] = []
+    failures: List[Tuple[ChunkWorkerJob, str, int]] = []
+    gpu_cursor = 0
+    completed = 0
+
+    try:
+        while pending or active:
+            while pending and len(active) < len(worker_gpus):
+                job = pending.pop(0)
+                gpu = worker_gpus[gpu_cursor % len(worker_gpus)]
+                gpu_cursor += 1
+                job.out_path.parent.mkdir(parents=True, exist_ok=True)
+                job.log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = job.log_path.open("w", encoding="utf-8")
+                cmd = build_chunk_worker_command(args, job)
+                LOG.info(
+                    "Starting %s chunk %d frames=%d..%d on CUDA_VISIBLE_DEVICES=%s; log=%s",
+                    job.video,
+                    job.chunk_index,
+                    job.frame_start_index,
+                    job.frame_end_index - 1,
+                    gpu,
+                    job.log_path,
+                )
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=chunk_worker_env(gpu),
+                )
+                active.append((proc, job, gpu, log_fh))
+
+            time.sleep(2.0)
+            still_active: List[Tuple[subprocess.Popen, ChunkWorkerJob, str, Any]] = []
+            for proc, job, gpu, log_fh in active:
+                return_code = proc.poll()
+                if return_code is None:
+                    still_active.append((proc, job, gpu, log_fh))
+                    continue
+                log_fh.close()
+                if return_code != 0:
+                    failures.append((job, gpu, int(return_code)))
+                else:
+                    completed += 1
+                    LOG.info(
+                        "Finished %s chunk %d on CUDA_VISIBLE_DEVICES=%s (%d/%d)",
+                        job.video,
+                        job.chunk_index,
+                        gpu,
+                        completed,
+                        len(jobs),
+                    )
+            active = still_active
+            if failures:
+                terminate_workers(active)
+                break
+    except KeyboardInterrupt:
+        terminate_workers(active)
+        raise
+
+    if failures:
+        messages = []
+        for job, gpu, return_code in failures:
+            messages.append(
+                "\n".join(
+                    [
+                        f"{job.video} chunk {job.chunk_index} failed on CUDA_VISIBLE_DEVICES={gpu} "
+                        f"with return code {return_code}.",
+                        f"log: {job.log_path}",
+                        log_tail(job.log_path),
+                    ]
+                )
+            )
+        raise RuntimeError("\n\n".join(messages))
+
+
+def read_detection_records_from_state(path: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    with zipfile.ZipFile(path, "r") as zf:
+        members = [
+            name
+            for name in zf.namelist()
+            if name.endswith(".pkl") and not name.endswith("_image.pkl")
+        ]
+        for member in members:
+            with zf.open(member, "r") as fh:
+                df = pickle.load(fh)
+            if not isinstance(df, pd.DataFrame):
+                continue
+            for _, row in df.iterrows():
+                records.append(row.to_dict())
+    return records
+
+
+def merge_chunk_worker_outputs(
+    args: argparse.Namespace,
+    jobs: Sequence[ChunkWorkerJob],
+    frame_refs_by_video: Mapping[str, Sequence[FrameRef]],
+    recondition_every: int,
+) -> None:
+    records_by_video: Dict[str, List[Dict[str, Any]]] = {video: [] for video in frame_refs_by_video}
+    for job in jobs:
+        if not job.out_path.exists():
+            raise FileNotFoundError(f"Missing chunk worker output: {job.out_path}")
+        records = read_detection_records_from_state(job.out_path)
+        LOG.info("Read %d detections from %s", len(records), job.out_path)
+        records_by_video[job.video].extend(records)
+
+    detections_by_video: Dict[str, pd.DataFrame] = {}
+    images_by_video: Dict[str, pd.DataFrame] = {
+        video: image_dataframe(refs) for video, refs in frame_refs_by_video.items()
+    }
+    for video, video_records in records_by_video.items():
+        if args.stitch_chunks:
+            before_track_count = len({int(record["track_id"]) for record in video_records})
+            video_records = stitch_chunk_tracks(video_records, args.stitch_iou)
+            before_unique = len(video_records)
+            video_records = dedupe_track_frame_records(video_records)
+            after_track_count = len({int(record["track_id"]) for record in video_records})
+            LOG.info(
+                "%s chunk stitch: %d -> %d track ids; frame-track rows %d -> %d",
+                video,
+                before_track_count,
+                after_track_count,
+                before_unique,
+                len(video_records),
+            )
+        else:
+            before_unique = len(video_records)
+            video_records = dedupe_track_frame_records(video_records)
+            if len(video_records) != before_unique:
+                LOG.info("%s frame-track dedupe: %d -> %d detections", video, before_unique, len(video_records))
+        if not args.no_dedupe:
+            before = len(video_records)
+            video_records = dedupe_records(video_records, args.nms_iou)
+            LOG.info("%s dedupe: %d -> %d detections", video, before, len(video_records))
+            before_unique = len(video_records)
+            video_records = dedupe_track_frame_records(video_records)
+            if len(video_records) != before_unique:
+                LOG.info("%s post-dedupe frame-track dedupe: %d -> %d detections", video, before_unique, len(video_records))
+        detections_by_video[video] = records_to_dataframe(video_records)
+
+    write_state(
+        out_path=args.out,
+        detections_by_video=detections_by_video,
+        images_by_video=images_by_video,
+        frame_refs_by_video=frame_refs_by_video,
+        args=args,
+        recondition_every=recondition_every,
+    )
+
+
+def run_parallel_chunk_workers(
+    args: argparse.Namespace,
+    frame_refs_by_video: Mapping[str, Sequence[FrameRef]],
+    recondition_every: int,
+) -> None:
+    worker_gpus = parse_worker_gpus(args.worker_gpus)
+    if not worker_gpus:
+        raise ValueError("--worker-gpus did not contain any GPU ids")
+    if args.gpus:
+        raise ValueError("--worker-gpus is independent process-per-chunk mode; remove --gpus.")
+    if args.chunk_frames <= 0:
+        raise ValueError("--worker-gpus requires --chunk-frames > 0")
+    if args.out.exists() and not args.overwrite:
+        raise FileExistsError(f"{args.out} already exists. Pass --overwrite to replace it.")
+    inherited_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if inherited_visible:
+        LOG.warning(
+            "--worker-gpus overrides parent CUDA_VISIBLE_DEVICES=%r inside each child. "
+            "Pass physical CUDA_VISIBLE_DEVICES values to --worker-gpus.",
+            inherited_visible,
+        )
+
+    jobs = make_chunk_worker_jobs(args, frame_refs_by_video)
+    LOG.info(
+        "Using robust chunk-worker mode: %d chunks across %d worker GPUs: %s",
+        len(jobs),
+        len(worker_gpus),
+        ",".join(worker_gpus),
+    )
+    for job in jobs:
+        LOG.info(
+            "Worker job %s chunk %d frames=%d..%d image_id_start=%d prompts=%s",
+            job.video,
+            job.chunk_index,
+            job.frame_start_index,
+            job.frame_end_index - 1,
+            job.image_id_start,
+            job.prompt_frames,
+        )
+    if args.dry_run:
+        return
+
+    run_chunk_worker_processes(args, jobs, worker_gpus)
+    merge_chunk_worker_outputs(args, jobs, frame_refs_by_video, recondition_every)
+
+
 def run_builder(args: argparse.Namespace) -> None:
     root = split_root(args.dataset_root, args.split)
     videos = discover_videos(root, args.videos)
@@ -1096,15 +1564,21 @@ def run_builder(args: argparse.Namespace) -> None:
         video_id_map,
         args.nframes,
         args.preserve_metadata_file_path,
+        frame_start_index=args.frame_start_index,
+        frame_end_index=args.frame_end_index,
+        image_id_start=args.image_id_start,
     )
     prompt_colors = make_prompt_color_hints(args)
     recondition_every = normalize_recondition_every(args)
 
     if args.mode == "periodic" and recondition_every <= 0 and args.prompt_refresh_every <= 0:
         raise ValueError("periodic mode requires --recondition-every > 0 or --prompt-refresh-every > 0")
+    if args.worker_gpus:
+        run_parallel_chunk_workers(args, frame_refs_by_video, recondition_every)
+        return
     if args.dry_run:
         for video, refs in frame_refs_by_video.items():
-            LOG.info("DRY RUN %s: %d frames, video_id=%d", video, len(refs), refs[0].video_id)
+            LOG.info("DRY RUN %s: %d frames, video_id=%s", video, len(refs), refs[0].video_id)
         return
 
     torch, predictor = build_predictor(args, recondition_every)
@@ -1126,6 +1600,13 @@ def run_builder(args: argparse.Namespace) -> None:
                     len(chunks),
                 )
                 for chunk_index, chunk_start, chunk_end, chunk_refs in chunks:
+                    output_chunk_index = (
+                        int(args.chunk_index_override)
+                        if args.chunk_index_override is not None
+                        else int(chunk_index)
+                    )
+                    output_chunk_start_frame = int(chunk_refs[0].frame)
+                    output_chunk_end_frame = int(chunk_refs[-1].frame)
                     chunk_dirname = f"{video}_chunk_{chunk_index:04d}_{chunk_start:06d}_{chunk_end - 1:06d}"
                     frame_dir = copy_frames_to_sam3_names(chunk_refs, tmp_root, dirname=chunk_dirname)
                     prompt_frames = prompt_frames_for_chunk(
@@ -1152,9 +1633,9 @@ def run_builder(args: argparse.Namespace) -> None:
                             prompt_index=prompt_index,
                             team_color_hint=color,
                             prompt_frames=prompt_frames,
-                            chunk_index=chunk_index,
-                            chunk_start_frame=chunk_start,
-                            chunk_end_frame=chunk_end - 1,
+                            chunk_index=output_chunk_index,
+                            chunk_start_frame=output_chunk_start_frame,
+                            chunk_end_frame=output_chunk_end_frame,
                             args=args,
                             recondition_every=recondition_every,
                         )
