@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # One-command SAM3 sweep for SNGS-021:
-#   native, periodic50, periodic60, periodic70
+#   native, periodic50, periodic60, periodic70, periodic80, periodic90, periodic100
 # For each variant this script builds the raw SAM3 TrackLab state, evaluates
 # raw atomic metrics, runs Step 3, evaluates Step 3 atomic metrics, then writes
 # a CSV summary.
@@ -29,7 +29,7 @@ OUT_ROOT="${OUT_ROOT:-/remote-home/jiayuanrao/yishan/SoccerMaster/codes/sn-games
 
 SPLIT="${SPLIT:-valid}"
 VIDEO="${VIDEO:-SNGS-021}"
-VARIANTS="${VARIANTS:-native periodic50 periodic60 periodic70}"
+VARIANTS="${VARIANTS:-native periodic50 periodic60 periodic70 periodic80 periodic90 periodic100}"
 VERSION="${VERSION:-sam3}"
 PROMPTS="${PROMPTS:-player}"
 
