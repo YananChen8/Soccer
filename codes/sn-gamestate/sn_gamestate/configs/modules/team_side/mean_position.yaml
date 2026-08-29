@@ -1,2 +1,6 @@
 _target_: sn_gamestate.team.TrackletTeamSideLabeling
-cfg: null
+cfg:
+  use_global_pitch_mapping: False
+  min_track_x_gap: 3.0
+  min_tracks_per_team: 2
+  window_sizes: [150, 300, 600, -1]
