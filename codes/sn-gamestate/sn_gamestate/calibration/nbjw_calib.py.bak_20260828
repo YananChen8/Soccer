@@ -176,7 +176,7 @@ class NBJW_Calib(ImageLevelModule):
         return image
 
     def process(self, batch: Any, detections: pd.DataFrame, metadatas: pd.DataFrame):
-        predictions = metadatas["keypoints"].iloc[0]
+        predictions = metadatas["keypoints"][0]
 
         self.cam.update(predictions)
         h = self.cam.get_homography_from_ground_plane(use_ransac=50, inverse=True)
@@ -229,7 +229,7 @@ class NBJW_Calib_Decoupled(ImageLevelModule):
         return image
 
     def process(self, batch: Any, detections: pd.DataFrame, metadatas: pd.DataFrame):
-        predictions = metadatas["keypoints"].iloc[0]
+        predictions = metadatas["keypoints"][0]
 
         self.cam.update(predictions)
         h = self.cam.get_homography_from_ground_plane(use_ransac=50, inverse=True)
@@ -275,8 +275,8 @@ class ApplyParameters(ImageLevelModule):
         return image
 
     def process(self, batch: Any, detections: pd.DataFrame, metadatas: pd.DataFrame):
-        h = metadatas["h"].iloc[0]
-        cam_params = metadatas["parameters"].iloc[0]
+        h = metadatas["h"][0]
+        cam_params = metadatas["parameters"][0]
         
         # Use previous homography/params if current ones are not available
         if self.use_prev_homography and ((self.use_h and (h is None or np.any(np.isnan(h)))) or (not self.use_h and 'x_focal_length' not in cam_params)):
@@ -340,8 +340,8 @@ class GetPitchCorners(ImageLevelModule):
         return image
 
     def process(self, batch: Any, detections: pd.DataFrame, metadatas: pd.DataFrame):
-        h = metadatas["h"].iloc[0]
-        cam_params = metadatas["parameters"].iloc[0]
+        h = metadatas["h"][0]
+        cam_params = metadatas["parameters"][0]
         image_corners = np.array([[0, 0], [self.image_width, 0], [self.image_width, self.image_height], [0, self.image_height]]) # 左上，右上，右下，左下
         
         # Use previous homography/params if current ones are not available
