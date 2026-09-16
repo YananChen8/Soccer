@@ -137,7 +137,13 @@ fields = [
 
 columns = ["variant", "state", "eval_dir", "summary_file"] + fields
 
-def parse_summary(path: Path) -> dict[str, str]:
+def numeric_token(token: str) -> bool:
+    return re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", token.strip()) is not None
+
+def split_tokens(line: str) -> list[str]:
+    return [token.strip() for token in line.replace(",", " ").replace("|", " ").split() if token.strip()]
+
+def parse_key_value_summary(path: Path) -> dict[str, str]:
     result = {}
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         if ":" not in line:
@@ -151,24 +157,66 @@ def parse_summary(path: Path) -> dict[str, str]:
             result[key] = match.group(0)
     return result
 
-def find_summary(eval_dir: Path) -> Path:
+def parse_table_summary(path: Path) -> dict[str, str]:
+    lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        header = split_tokens(line)
+        if "HOTA" not in header or "DetA" not in header:
+            continue
+        for data_line in lines[idx + 1 : idx + 6]:
+            tokens = split_tokens(data_line)
+            numbers = [token for token in tokens if numeric_token(token)]
+            if len(numbers) < 3:
+                continue
+            values = numbers[-len(header):]
+            return {key: value for key, value in zip(header, values) if key in fields}
+    return {}
+
+def parse_detailed_csv(path: Path) -> dict[str, str]:
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            seq = (row.get("seq") or "").strip().upper()
+            if seq not in {"COMBINED", "COMBINED_SEQ"}:
+                continue
+            return {key: row[key] for key in fields if key in row and row[key] not in (None, "")}
+    return {}
+
+def parse_metric_file(path: Path) -> dict[str, str]:
+    if path.name.endswith("_detailed.csv"):
+        return parse_detailed_csv(path)
+    parsed = parse_key_value_summary(path)
+    if parsed.get("HOTA"):
+        return parsed
+    return parse_table_summary(path)
+
+def candidate_metric_files(eval_dir: Path) -> list[Path]:
+    if not eval_dir.exists():
+        return []
+    candidates = []
     priorities = [
         "cls_comb_det_av_summary.txt",
         "all_summary.txt",
         "cls_comb_cls_av_summary.txt",
     ]
     for name in priorities:
-        matches = sorted(eval_dir.rglob(name)) if eval_dir.exists() else []
-        if matches:
-            return matches[0]
-    matches = sorted(eval_dir.rglob("*_summary.txt")) if eval_dir.exists() else []
-    if not matches:
+        candidates.extend(sorted(eval_dir.rglob(name)))
+    candidates.extend(sorted(path for path in eval_dir.rglob("*_summary.txt") if path not in candidates))
+    candidates.extend(sorted(eval_dir.rglob("*_detailed.csv")))
+    return candidates
+
+def find_metrics(eval_dir: Path) -> tuple[Path, dict[str, str]]:
+    candidates = candidate_metric_files(eval_dir)
+    if not candidates:
         raise FileNotFoundError(f"No TrackEval summary found under {eval_dir}")
-    return matches[0]
+    for path in candidates:
+        parsed = parse_metric_file(path)
+        if parsed.get("HOTA"):
+            return path, parsed
+    return candidates[0], {}
 
 def row_for(variant: str, state: Path, eval_dir: Path) -> dict[str, str]:
-    summary = find_summary(eval_dir)
-    parsed = parse_summary(summary)
+    summary, parsed = find_metrics(eval_dir)
     row = {
         "variant": variant,
         "state": str(state),
