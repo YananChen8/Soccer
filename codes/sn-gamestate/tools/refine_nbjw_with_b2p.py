@@ -1094,6 +1094,8 @@ def run_b2p_inference_to_cache(frames: Sequence[StateFrame], args: argparse.Name
             "or precompute the .npz cache in that environment."
         ) from exc
 
+    install_b2p_torchvision_compat()
+
     sys.path.insert(0, str(args.b2p_root))
     try:
         import kpts as b2p_kpts
@@ -1106,6 +1108,7 @@ def run_b2p_inference_to_cache(frames: Sequence[StateFrame], args: argparse.Name
             pass
 
     device = args.b2p_device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    patch_b2p_efficientnet_no_pretrained(b2p_kpts)
     model = b2p_kpts.Unet(out_ch=98, num_lines=21)
     state_dict = torch.load(str(args.checkpoint), map_location=device)
     model.load_state_dict(state_dict, strict=True)
@@ -1129,6 +1132,89 @@ def run_b2p_inference_to_cache(frames: Sequence[StateFrame], args: argparse.Name
             continue
         obs = predict_single_b2p_observation(image, model, b2p_kpts, torch, torch_f, device, out_path, args)
         save_observation_npz(out_path, obs)
+
+
+def install_b2p_torchvision_compat() -> None:
+    """Let B2P kpts.py import on older SoccerMaster torchvision builds.
+
+    The refinement path only uses B2P's model and heatmap helpers. Some B2P
+    training/data-augmentation utilities import torchvision.transforms.v2, which
+    is absent in older but otherwise compatible torchvision versions.
+    """
+    try:
+        import torchvision
+        import torchvision.models as tv_models
+        import torchvision.transforms as legacy_transforms
+    except Exception:
+        return
+
+    if not hasattr(tv_models, "EfficientNet_V2_S_Weights"):
+        class _EfficientNetV2SWeightsCompat:
+            DEFAULT = None
+
+        tv_models.EfficientNet_V2_S_Weights = _EfficientNetV2SWeightsCompat
+
+    try:
+        import torchvision.transforms.v2  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    import types
+    import torch
+
+    class _ToImage(torch.nn.Module):
+        def forward(self, image: Any) -> Any:
+            if torch.is_tensor(image):
+                return image
+            return legacy_transforms.ToTensor()(image)
+
+    module = types.ModuleType("torchvision.transforms.v2")
+    for name in (
+        "Compose",
+        "RandomChoice",
+        "RandomPerspective",
+        "RandomRotation",
+        "RandomAffine",
+        "RandomApply",
+        "ColorJitter",
+        "Normalize",
+    ):
+        if hasattr(legacy_transforms, name):
+            setattr(module, name, getattr(legacy_transforms, name))
+
+    class _Resize(legacy_transforms.Resize):
+        def __init__(self, size: Any, *args: Any, antialias: Any = None, **kwargs: Any):
+            super().__init__(size, *args, **kwargs)
+
+    module.Resize = _Resize
+    module.ToImage = _ToImage
+    module.ToDtype = lambda dtype, scale=False: torch.nn.Identity()
+
+    sys.modules["torchvision.transforms.v2"] = module
+    try:
+        legacy_transforms.v2 = module
+        torchvision.transforms.v2 = module
+    except Exception:
+        pass
+
+
+def patch_b2p_efficientnet_no_pretrained(b2p_kpts: Any) -> None:
+    """Avoid downloading torchvision EfficientNet weights before loading B2P."""
+    try:
+        original = b2p_kpts.torchvision.models.efficientnet_v2_s
+    except Exception:
+        return
+
+    def _efficientnet_v2_s_no_weights(*args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("weights", None)
+        kwargs.pop("pretrained", None)
+        try:
+            return original(*args, weights=None, **kwargs)
+        except TypeError:
+            return original(*args, pretrained=False, **kwargs)
+
+    b2p_kpts.torchvision.models.efficientnet_v2_s = _efficientnet_v2_s_no_weights
 
 
 def predict_single_b2p_observation(
